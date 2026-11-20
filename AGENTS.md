@@ -36,6 +36,7 @@ Accounts: `admin` (ADMIN), `staff1` and `staff2` (STAFF). `db:seed` reads their 
 
 ## Conventions
 
+- Domain terms are in `GLOSSARY.md`. Use its words in code, UI and docs, and avoid the synonyms it lists.
 - Put rules in `src/lib/`, not in components or route handlers, and cover them with a Vitest test.
 - Guard pages with `requirePageUser()` and API routes with `requireApiUser()` (`src/lib/session.ts`). Pass `"ADMIN"` for admin-only. Validate request bodies with the Zod schemas in `validators.ts`.
 - Every change to a record writes an `AuditLog` row via `writeAudit()` with user, action, entity and reason. Pass the transaction client when inside `db.$transaction`.
