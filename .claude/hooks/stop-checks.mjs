@@ -8,54 +8,60 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const TEST_COMMAND = "npm test";
-const MAX_RETRIES = 3; // stop sending Claude back after this many failed attempts in one session
+const MAX_RETRIES = 3; // per user turn, so Claude cannot loop forever
+const MAX_LINT_FILES = 100; // above this, lint the whole project (Windows caps command length)
 
 const input = JSON.parse(readFileSync(0, "utf8") || "{}");
 const root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-const run = (cmd, args) => spawnSync(cmd, args, {
-    cwd: root,
-    encoding: "utf8",
-    shell: true,
-    env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-  });
-const git = (...args) => run("git", args).stdout ?? "";
+const opts = { cwd: root, encoding: "utf8", env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" } };
+const git = (...args) => spawnSync("git", args, opts).stdout ?? "";
+const sh = (command) => spawnSync(command, { ...opts, shell: true }); // npm and npx need a shell on Windows
 const hash = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
 
 // Changed = everything that differs from where this branch left main, committed or not.
-const base = git("merge-base", "HEAD", "origin/main").trim();
-const diff = base ? git("diff", base) : git("diff", "HEAD");
-const tracked = (base ? git("diff", "--name-only", base) : git("diff", "--name-only", "HEAD")).split("\n");
+const base = git("merge-base", "HEAD", "origin/main").trim() || "HEAD";
+const diff = git("diff", base);
+const tracked = git("diff", "--name-only", base).split("\n");
 const untracked = git("ls-files", "--others", "--exclude-standard").split("\n");
-const code = [...new Set([...tracked, ...untracked])].filter(
-  (f) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f) && existsSync(join(root, f)),
-);
-if (code.length === 0) process.exit(0);
+const changed = [...new Set([...tracked, ...untracked])].filter((f) => f && existsSync(join(root, f)));
+const code = changed.filter((f) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f));
+if (code.length === 0 && !changed.some((f) => /(^|\/)package(-lock)?\.json$/.test(f))) process.exit(0);
 
-// Skip when nothing changed since the last passing run.
 const stateFile = join(tmpdir(), `claude-stop-checks-${hash(root)}.json`);
 const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
 const key = hash(diff + untracked.map((f) => (f && existsSync(join(root, f)) ? f + statSync(join(root, f)).mtimeMs : "")).join());
+const save = (next) => writeFileSync(stateFile, JSON.stringify(next));
+
+// Nothing changed since the last pass, or since the last failure Claude was already told about
+// (it chose to explain instead of changing code): let it stop.
 if (state.passed === key) process.exit(0);
+if (input.stop_hook_active && state.failed === key) process.exit(0);
 
 const failures = [];
-const lint = run("npx", ["eslint", ...code.map((f) => JSON.stringify(f))]);
-if (lint.status !== 0) failures.push(["Lint (npx eslint <changed files>)", lint]);
-const test = run(TEST_COMMAND, []);
+const quote = (f) => `"${f.replace(/["$`\\]/g, "\\$&")}"`;
+const lintTarget = code.length > MAX_LINT_FILES ? "." : code.map(quote).join(" ");
+if (lintTarget) {
+  const lint = sh(`npx eslint ${lintTarget}`);
+  if (lint.status !== 0) failures.push(["Lint (eslint on changed files)", lint]);
+}
+const test = sh(TEST_COMMAND);
 if (test.status !== 0) failures.push([`Tests (${TEST_COMMAND})`, test]);
 
-const session = input.session_id || "unknown";
 if (failures.length === 0) {
-  writeFileSync(stateFile, JSON.stringify({ passed: key }));
+  save({ passed: key });
   process.exit(0);
 }
 
-const tries = (state.retries?.[session] ?? 0) + 1;
-writeFileSync(stateFile, JSON.stringify({ retries: { [session]: tries } }));
+// A stop that is not a hook continuation starts a new count, so one bad stretch
+// does not switch the hook off for the rest of the session.
+const tries = input.stop_hook_active ? (state.tries ?? 0) + 1 : 1;
+save({ failed: key, tries });
 if (tries > MAX_RETRIES) process.exit(0);
 
 const tail = (r) => `${r.stdout ?? ""}${r.stderr ?? ""}`.trim().split("\n").slice(-60).join("\n");
 console.error(
-  `Checks failed (attempt ${tries} of ${MAX_RETRIES}). Fix them before finishing, or explain why they cannot pass.\n\n` +
+  `Checks failed (attempt ${tries} of ${MAX_RETRIES}). Fix them before finishing. ` +
+    `If they cannot pass for a reason outside your change, say why and stop without editing again.\n\n` +
     failures.map(([name, r]) => `## ${name}\n${tail(r)}`).join("\n\n"),
 );
 process.exit(2);
